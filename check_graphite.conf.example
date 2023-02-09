@@ -1,0 +1,8 @@
+# set the database connection to use
+db = ""
+# set the checker id from the database
+checker_id = 2
+# set the duration after nothing to check was returned
+wait_duration = 30
+# set the number of parallel jobs to run
+# jobs = 4
