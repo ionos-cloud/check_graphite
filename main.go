@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/burntsushi/toml"
+	"github.com/BurntSushi/toml"
 	"github.com/lib/pq"
 )
 
