@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -19,15 +20,15 @@ import (
 	"sync"
 	"time"
 
+	"git.zero-knowledge.org/gibheer/monzero"
 	"github.com/BurntSushi/toml"
-	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 )
 
 var (
 	configPath = flag.String("config", "check_graphite.conf", "path to the config file")
 	daemon     = flag.Bool("daemon", false, "run as a daemon, requires a config file")
 	addr       = flag.String("addr", "", "Set the address of the graphite server to use.")
-	interval   = flag.String("interval", "60s", "Set the interval to use for checking")
 	levelWarn  = flag.Float64("warn", 0, "Set the level when it should be a warning.")
 	levelErr   = flag.Float64("error", 0, "Set the level when it should be an error")
 	key        = flag.String("key", "", "The key to check for the levels")
@@ -85,9 +86,18 @@ func main() {
 	client := &http.Client{Transport: tr}
 
 	if !*daemon {
-		msg, exitCode := runCheck(client, *addr, *key, *message, *interval, *levelWarn, *levelErr)
-		fmt.Println(msg)
-		os.Exit(exitCode)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		r := runner{client: client}
+		result := r.runCheck(
+			monzero.Check{
+				Command:   os.Args,
+				ExitCodes: []int{},
+			},
+			ctx,
+		)
+		fmt.Println(result.Message)
+		os.Exit(result.ExitCode)
 	}
 
 	if config.Jobs == 0 {
@@ -97,105 +107,77 @@ func main() {
 	for i := 0; i < config.Jobs; i++ {
 		wg.Add(1)
 		go func(thread int) {
-			log.Printf("starting thread with id '%d'", thread)
-			fs := flag.NewFlagSet(fmt.Sprintf("check_graphite thread %d", thread), flag.ContinueOnError)
-			addr := fs.String("addr", "", "Set the address of the graphite server to use.")
-			interval := fs.String("interval", "60s", "Set the interval to use for checking")
-			levelWarn := fs.Float64("warn", 0, "Set the level when it should be a warning.")
-			levelErr := fs.Float64("error", 0, "Set the level when it should be an error")
-			key := fs.String("key", "", "The key to check for the levels")
-			message := fs.String("message", "current value: %f", "Create a result message based on the template. Use %f to place the numeric value. To write the % sign, write %%")
-
+			r := &runner{
+				client: client,
+			}
+			checker, err := monzero.NewChecker(monzero.CheckerConfig{
+				DB:             db,
+				Timeout:        30 * time.Second,
+				HostIdentifier: hostname,
+				Executor:       r.runCheck,
+			})
+			if err != nil {
+				log.Fatalf("could not start checker: %s", err)
+			}
 			for {
-				tx, err := db.Begin()
-				if err != nil {
-					log.Printf("could not start transaction: %s", err)
-					continue
+				if err := checker.Next(); err != nil {
+					if err != monzero.ErrNoCheck {
+						log.Printf("error when getting the next check: %s", err)
+					}
+					time.Sleep(time.Duration(config.Wait) * time.Second)
 				}
-				var (
-					id      int64
-					cmdLine []string
-					states  States
-					mapId   int
-					state   int
-					msg     string
-				)
-				row := tx.QueryRow(`select check_id, cmdLine, states, mapping_id
-					from active_checks
-					where next_time < now()
-					and enabled
-					and checker_id = $1
-					order by next_time
-					for update skip locked
-					limit 1;`, config.CheckerID)
-				err = row.Scan(&id, pq.Array(&cmdLine), &states, &mapId)
-				if err != nil && err == sql.ErrNoRows {
-					tx.Rollback()
-					time.Sleep(time.Second * time.Duration(config.Wait))
-					continue
-				} else if err != nil {
-					log.Printf("could not scan values: %s", err)
-					tx.Rollback()
-					time.Sleep(time.Second * time.Duration(config.Wait))
-					continue
-				}
-
-				if err := fs.Parse(cmdLine[1:]); err != nil {
-					msg = fmt.Sprintf("could not parse arguments: %s", err)
-					state = 3
-				} else {
-					msg, state = runCheck(client, *addr, *key, *message, *interval, *levelWarn, *levelErr)
-				}
-
-				if _, err := tx.Exec(`update active_checks ac
-                set next_time = now() + intval, states = ARRAY[$2::int] || states[1:4],
-                                msg = $3,
-                                acknowledged = case when $4 then false else acknowledged end,
-                                state_since = case $2 when states[1] then state_since else now() end
-                        where check_id = $1`, id, &state, &msg, states.ToOK()); err != nil {
-					log.Printf("[%d] could not update row '%d': %s", thread, id, err)
-					tx.Rollback()
-					continue
-				}
-				if _, err := tx.Exec(`insert into notifications(check_id, states, output, mapping_id, notifier_id, check_host)
-                        select $1, ac.states, $2, $3, cn.notifier_id, $4
-                        from active_checks ac
-                        join checks_notify cn on ac.check_id = cn.check_id
-                        where ac.check_id = $1
-                                and ac.acknowledged = false;`,
-					&id, &msg, &mapId, &hostname); err != nil {
-					log.Printf("[%d] could not create notification for '%d': %s", thread, id, err)
-					tx.Rollback()
-					continue
-				}
-				tx.Commit()
 			}
 		}(i)
 	}
 	wg.Wait()
 }
 
-// runCheck runs the check with the client and returns the resulting message and exit code.
-func runCheck(c *http.Client, addr, key, msg, intVal string, levelWarn, levelErr float64) (string, int) {
-	if addr == "" {
-		return "no address given to check", 3
+type (
+	runner struct {
+		client *http.Client
 	}
-	if intVal == "" {
-		return "no interval given", 3
-	}
-	if key == "" {
-		return "no key given", 3
+)
+
+func (r *runner) runCheck(check monzero.Check, ctx context.Context) monzero.CheckResult {
+	result := monzero.CheckResult{ExitCode: 3}
+
+	fs := flag.NewFlagSet("check_graphite", flag.ContinueOnError)
+	addr := fs.String("addr", "", "Set the address of the graphite server to use.")
+	interval := fs.String("interval", "60s", "Set the interval to use for checking")
+	levelWarn := fs.Float64("warn", 0, "Set the level when it should be a warning.")
+	levelErr := fs.Float64("error", 0, "Set the level when it should be an error")
+	key := fs.String("key", "", "The key to check for the levels")
+	retries := fs.Int("retries", 0, "the number of retries before the check is returned as failed")
+	message := fs.String("message", "current value: %f", "Create a result message based on the template. Use %f to place the numeric value. To write the % sign, write %%")
+
+	if err := fs.Parse(check.Command[1:]); err != nil {
+		result.Message = fmt.Sprintf("could not parse arguments: %s", err)
+		return result
 	}
 
-	url, err := url.Parse(addr)
+	if *addr == "" {
+		result.Message = "no address given to check"
+		return result
+	}
+	if *interval == "" {
+		result.Message = "no interval given"
+		return result
+	}
+	if *key == "" {
+		result.Message = "no key given"
+		return result
+	}
+
+	url, err := url.Parse(*addr)
 	if err != nil {
-		return fmt.Sprintf("could not parse addr '%s': %s", addr, err), 3
+		result.Message = fmt.Sprintf("could not parse addr '%s': %s", addr, err)
+		return result
 	}
 	url.Path = url.Path + "/render"
 	query := url.Query()
 	query.Set("format", "json")
-	query.Set("target", key)
-	query.Set("from", "-"+intVal)
+	query.Set("target", *key)
+	query.Set("from", "-"+*interval)
 	url.RawQuery = query.Encode()
 
 	var (
@@ -203,16 +185,19 @@ func runCheck(c *http.Client, addr, key, msg, intVal string, levelWarn, levelErr
 		raw []byte
 	)
 	success := false
-	for i := 0; i < 2; i++ {
-		res, err = c.Get(url.String())
+
+	for i := 0; i < *retries+1; i++ {
+		res, err = r.client.Get(url.String())
 		if err != nil {
-			return fmt.Sprintf("could not get result: %s", err), 3
+			result.Message = fmt.Sprintf("could not get result: %s", err)
+			return result
 		}
 		defer res.Body.Close()
 
 		raw, err = ioutil.ReadAll(res.Body)
 		if err != nil {
-			return fmt.Sprintf("could not read content body: %s", err), 3
+			result.Message = fmt.Sprintf("could not read content body: %s", err)
+			return result
 		}
 
 		// For some reason metrictank is unable to return any data when it goes into
@@ -223,58 +208,59 @@ func runCheck(c *http.Client, addr, key, msg, intVal string, levelWarn, levelErr
 			continue
 		}
 		if res.StatusCode != http.StatusOK {
-			return fmt.Sprintf("graphite api answered with status code %d", res.StatusCode), 3
+			result.Message = fmt.Sprintf("graphite api answered with status code %d", res.StatusCode)
+			return result
 		}
 		success = true
 		break
 	}
+
 	if !success {
-		return fmt.Sprintf("graphite api has internal problems, answered with status code: %d", res.StatusCode), 3
+		result.Message = fmt.Sprintf("graphite api has internal problems, answered with status code: %d", res.StatusCode)
+		return result
 	}
 
 	payload := Result{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return fmt.Sprintf("could not parse json content: %s\n%s", err, raw), 3
+		result.Message = fmt.Sprintf("could not parse json content: %s\n%s", err, raw)
+		return result
 	}
 
 	var curVal *float64
-	exitCode := 0
+	result.ExitCode = 0
 	for _, target := range payload {
 		for _, point := range target.Datapoints {
 			if point[0] == nil {
 				continue
 			}
-			if levelErr < levelWarn {
+			if *levelErr < *levelWarn {
 				if curVal == nil || *point[0] < *curVal {
 					curVal = point[0]
 				}
-				if *point[0] <= levelErr && exitCode != 1 {
-					exitCode = 2
-				} else if *point[0] <= levelWarn && exitCode == 0 {
-					exitCode = 1
+				if *point[0] <= *levelErr && result.ExitCode != 1 {
+					result.ExitCode = 2
+				} else if *point[0] <= *levelWarn && result.ExitCode == 0 {
+					result.ExitCode = 1
 				}
 			} else {
 				if curVal == nil || *point[0] > *curVal {
 					curVal = point[0]
 				}
-				if *point[0] >= levelErr && exitCode != 1 {
-					exitCode = 2
-				} else if *point[0] >= levelWarn && exitCode == 0 {
-					exitCode = 1
+				if *point[0] >= *levelErr && result.ExitCode != 1 {
+					result.ExitCode = 2
+				} else if *point[0] >= *levelWarn && result.ExitCode == 0 {
+					result.ExitCode = 1
 				}
 			}
 		}
 	}
 	if curVal == nil {
-		log.Printf("number of targets received for key '%s': %d", key, len(payload))
-		if len(payload) > 0 {
-			for i, target := range payload {
-				log.Printf("number of datapoints in target %d: %d", i, len(target.Datapoints))
-			}
-		}
-		return "no values received! Is the host down?!", 2
+		result.ExitCode = 2
+		result.Message = "No values received for query! Is the host down?"
+		return result
 	}
-	return fmt.Sprintf(*message+"\n", *curVal), exitCode
+	result.Message = fmt.Sprintf(*message+"\n", *curVal)
+	return result
 }
 
 func Unknown(msg string, args ...interface{}) {

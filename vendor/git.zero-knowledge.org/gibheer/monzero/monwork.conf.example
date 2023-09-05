@@ -1,0 +1,4 @@
+{
+  "db": "user=monwork dbname=monzero",
+  "interval": "5s"
+}
