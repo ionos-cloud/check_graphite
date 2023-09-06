@@ -1,0 +1,79 @@
+# db contains the database credentials.
+# For available options, see https://godoc.org/github.com/lib/pq
+db = "user=username password=password sslmode=disable dbname=monzero"
+
+# Listen sets the IP and port to start listening for incoming connections.
+listen = "127.0.0.1:8080"
+
+# Change the template path to a different directory.
+#template_path = "templates"
+
+[ssl]
+# Enable SSL support to start listening for incoming connections.
+# This is required for some authentication modes.
+enable = false
+# Configure the path to the private key of the certificate.
+#private_key = "monfront.priv"
+# Set the path to the certificate.
+#certificate = "monfront.crt"
+
+[authentication]
+# mode can be one of "none", "header", "list", "db", "cert"
+# * none disables the authentication
+# * header checks the header of the header parameter
+# * list uses the list parameter to check usernames and passwords
+# * db uses the db credentials to check usernames and passwords
+# * cert uses a client certificate CA to check incoming users
+#
+# When setting a mode of list or db, SSL settings are required to protect
+# the provided credentials.
+mode = "none"
+
+# Set a random string to generate session tokens. The token is placed in a
+# cookie with secure flags, so that the session can't be misused.
+#session_token = ""
+
+# allow_anonymous allows users to view the frontend even when not
+# authenticated.
+#allow_anonymous = false
+
+# When the mode is set to header, this header must contain the username the
+# user was authenticated as. It will then be used to load the permissions.
+# header = "X-AUTH-NAME"
+
+# When using the mode list, this list is checked for matches of usernames
+# and passwords.
+#list = [
+#  ["user1", "passwordhash"],
+#  ["user2", "anotherpass"],
+#]
+
+# Set the path to the client certificate CA to check incoming client
+# certificates.
+#cert = "clientCA.crt"
+
+[authorization]
+# The mode decides who gets to change data in the frontend.
+# It can be one of:
+# * none - nobody can change data
+# * list - usernames from a specific list can change data
+# * db - users allowed to change data is loaded from the database
+# * all - everyone can change all the data
+mode = "all"
+
+# The list defines the usernames allowed to change data in the frontend. They
+# must be authenticated to get the permission.
+#list = ["user1", "user2"]
+
+[log]
+# With format the log output format can be switched between `text`
+# and `json` output.
+#format = "text"
+
+# With level the amount of logs can be reduced when necessary. The supported
+# levels are `error`, `warn`, `info` and `debug`.
+#level = "info"
+
+# Output decides where to send all generated log output. It can either be a path
+# or one of the special outputs `stdout` or `stderr`.
+#output = "stderr"

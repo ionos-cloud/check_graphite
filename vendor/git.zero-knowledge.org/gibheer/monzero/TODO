@@ -1,0 +1,3 @@
+* add proper error pages
+* handle errors with proper codes
+* add method router separation
