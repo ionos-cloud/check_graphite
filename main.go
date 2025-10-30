@@ -170,7 +170,7 @@ func (r *runner) runCheck(check monzero.Check, ctx context.Context) monzero.Chec
 
 	url, err := url.Parse(*addr)
 	if err != nil {
-		result.Message = fmt.Sprintf("could not parse addr '%s': %s", addr, err)
+		result.Message = fmt.Sprintf("could not parse addr '%s': %s", *addr, err)
 		return result
 	}
 	url.Path = url.Path + "/render"
